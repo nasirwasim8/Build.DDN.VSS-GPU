@@ -1,0 +1,354 @@
+#!/bin/bash
+# ============================================================
+#  DDN Multimodal Semantic Search — WSL/Ubuntu 22.04 Deploy
+#  Pulls from GitHub and runs backend + frontend under PM2
+# ============================================================
+#
+#  Usage:
+#    chmod +x wsl_deploy.sh
+#    ./wsl_deploy.sh
+#
+#  What this script does:
+#    1.  Installs system deps (Python 3.11, Node 20, Redis, build tools)
+#    2.  Installs PM2 globally
+#    3.  Clones / pulls the repo from GitHub
+#    4.  Creates .env from template (prompts for values if missing)
+#    5.  Sets up Python venv + pip installs for backend
+#    6.  Installs Node deps + builds frontend (production)
+#    7.  Starts Redis (system service)
+#    8.  Creates ecosystem.config.js for PM2
+#    9.  Starts / restarts all services under PM2
+#   10.  Saves PM2 startup so services survive reboots
+#
+# ============================================================
+
+set -euo pipefail
+
+# ─── Colours ────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+ok()   { echo -e "${GREEN}✔  $*${NC}"; }
+info() { echo -e "${BLUE}ℹ  $*${NC}"; }
+warn() { echo -e "${YELLOW}⚠  $*${NC}"; }
+fail() { echo -e "${RED}✖  $*${NC}"; exit 1; }
+hr()   { echo -e "${CYAN}$(printf '─%.0s' {1..60})${NC}"; }
+
+# ─── Config ──────────────────────────────────────────────────
+GITHUB_REPO="https://github.com/nasirwasim8/Build.DDN.Semantic_Search.git"
+INSTALL_DIR="$HOME/projects/Build.DDN.Semantic_Search"
+BACKEND_PORT=8001
+FRONTEND_PORT=5175
+PYTHON_BIN=python3.11
+
+hr
+echo -e "${BOLD}${BLUE}"
+echo "   ██████╗ ██████╗ ███╗   ██╗"
+echo "   ██╔══██╗██╔══██╗████╗  ██║"
+echo "   ██║  ██║██║  ██║██╔██╗ ██║"
+echo "   ██║  ██║██║  ██║██║╚██╗██║"
+echo "   ██████╔╝██████╔╝██║ ╚████║"
+echo "   ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝"
+echo -e "${NC}"
+echo -e "${BOLD}  DDN Multimodal Semantic Search — WSL Deployment${NC}"
+hr
+echo ""
+
+# ─── 0. Must NOT be run as root ──────────────────────────────
+if [ "$EUID" -eq 0 ]; then
+  fail "Do NOT run this script as root / sudo. Run as a normal user; sudo is called internally where needed."
+fi
+
+# ─── 1. System packages ──────────────────────────────────────
+hr
+echo -e "${BOLD}[1/9] Installing system packages${NC}"
+hr
+
+sudo apt-get update -qq
+sudo apt-get install -y --no-install-recommends \
+    git curl wget ca-certificates gnupg lsb-release \
+    build-essential pkg-config libssl-dev libffi-dev \
+    python3.11 python3.11-venv python3.11-dev python3-pip \
+    ffmpeg libsm6 libxext6 libgl1 \
+    redis-server > /dev/null 2>&1
+
+ok "System packages installed"
+
+# ─── 2. Node.js 20 LTS (via NodeSource) ─────────────────────
+if ! command -v node &>/dev/null || [ "$(node -v | cut -dv -f2 | cut -d. -f1)" -lt 18 ]; then
+  info "Installing Node.js 20 LTS..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - > /dev/null 2>&1
+  sudo apt-get install -y nodejs > /dev/null 2>&1
+  ok "Node.js $(node -v) installed"
+else
+  ok "Node.js $(node -v) already present"
+fi
+
+# ─── 3. PM2 ──────────────────────────────────────────────────
+if ! command -v pm2 &>/dev/null; then
+  info "Installing PM2 globally..."
+  sudo npm install -g pm2 > /dev/null 2>&1
+  ok "PM2 installed"
+else
+  ok "PM2 $(pm2 -v) already present"
+fi
+
+# ─── 4. Clone / update repo ──────────────────────────────────
+hr
+echo -e "${BOLD}[2/9] Fetching latest code from GitHub${NC}"
+hr
+
+mkdir -p "$(dirname "$INSTALL_DIR")"
+
+if [ -d "$INSTALL_DIR/.git" ]; then
+  info "Repo exists — pulling latest changes..."
+  git -C "$INSTALL_DIR" pull --rebase origin main 2>&1 | tail -3
+  ok "Repository updated"
+else
+  info "Cloning repository to $INSTALL_DIR ..."
+  git clone "$GITHUB_REPO" "$INSTALL_DIR"
+  ok "Repository cloned"
+fi
+
+cd "$INSTALL_DIR"
+
+# ─── 5. Environment file ─────────────────────────────────────
+hr
+echo -e "${BOLD}[3/9] Configuring .env file${NC}"
+hr
+
+ENV_FILE="$INSTALL_DIR/backend/.env"
+
+if [ ! -f "$ENV_FILE" ]; then
+  warn "No .env found — creating from template."
+  echo ""
+  echo -e "${YELLOW}Please provide configuration values (press ENTER to leave blank):${NC}"
+  echo ""
+
+  read -rp "  DDN INFINIA Endpoint (e.g. https://your-infinia.com): " INFINIA_ENDPOINT
+  read -rp "  DDN INFINIA Access Key: " INFINIA_ACCESS_KEY
+  read -rp "  DDN INFINIA Secret Key: " INFINIA_SECRET_KEY
+  read -rp "  DDN INFINIA Bucket [multimodal-search]: " INFINIA_BUCKET
+  INFINIA_BUCKET="${INFINIA_BUCKET:-multimodal-search}"
+  read -rp "  NVIDIA API Key (optional, press ENTER to skip): " NVIDIA_API_KEY
+  echo ""
+
+  cat > "$ENV_FILE" <<EOF
+# DDN Multimodal Semantic Search — Environment Configuration
+# Generated by wsl_deploy.sh on $(date)
+
+ENVIRONMENT=production
+
+# DDN INFINIA
+INFINIA_ENDPOINT=${INFINIA_ENDPOINT}
+INFINIA_ACCESS_KEY=${INFINIA_ACCESS_KEY}
+INFINIA_SECRET_KEY=${INFINIA_SECRET_KEY}
+INFINIA_BUCKET=${INFINIA_BUCKET}
+INFINIA_REGION=us-east-1
+
+# NVIDIA (optional)
+NVIDIA_API_KEY=${NVIDIA_API_KEY}
+
+# Backend
+HOST=0.0.0.0
+PORT=${BACKEND_PORT}
+DEBUG=false
+
+# Redis (Celery broker)
+REDIS_URL=redis://localhost:6379/0
+CELERY_BROKER_URL=redis://localhost:6379/0
+CELERY_RESULT_BACKEND=redis://localhost:6379/1
+EOF
+  ok ".env created at $ENV_FILE"
+else
+  ok ".env already exists — skipping (edit $ENV_FILE manually if needed)"
+fi
+
+# ─── 6. Python virtualenv + pip deps ─────────────────────────
+hr
+echo -e "${BOLD}[4/9] Setting up Python virtual environment${NC}"
+hr
+
+VENV_DIR="$INSTALL_DIR/backend/venv"
+
+if [ ! -d "$VENV_DIR" ]; then
+  info "Creating virtual environment with $PYTHON_BIN..."
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+  ok "Virtual environment created"
+else
+  ok "Virtual environment already exists"
+fi
+
+info "Upgrading pip..."
+"$VENV_DIR/bin/pip" install --upgrade pip --quiet
+
+hr
+echo -e "${BOLD}[5/9] Installing Python dependencies${NC}"
+hr
+info "This may take several minutes on first run (PyTorch etc.)..."
+
+# Install PyTorch separately first with CUDA 12.1 support (falls back to CPU if no GPU)
+if command -v nvidia-smi &>/dev/null 2>&1; then
+  CUDA_VERSION=$(nvidia-smi | grep -oP "CUDA Version: \K[0-9]+" | head -1)
+  info "NVIDIA GPU detected — installing PyTorch with CUDA ${CUDA_VERSION} support..."
+  "$VENV_DIR/bin/pip" install torch torchvision torchaudio \
+      --index-url https://download.pytorch.org/whl/cu121 --quiet
+else
+  warn "No NVIDIA GPU detected — installing CPU-only PyTorch (AI models will be slower)"
+  "$VENV_DIR/bin/pip" install torch torchvision torchaudio \
+      --index-url https://download.pytorch.org/whl/cpu --quiet
+fi
+
+# Install the rest of the requirements
+"$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/backend/requirements.txt" --quiet
+
+ok "Python dependencies installed"
+
+# ─── 7. Frontend build ───────────────────────────────────────
+hr
+echo -e "${BOLD}[6/9] Building React/Vite frontend${NC}"
+hr
+
+cd "$INSTALL_DIR/frontend"
+
+# Write frontend env pointing to local backend
+cat > .env.production <<EOF
+VITE_API_URL=http://localhost:${BACKEND_PORT}
+EOF
+
+info "Installing npm packages..."
+npm install --silent
+
+info "Building production bundle..."
+npm run build
+
+ok "Frontend built — output in frontend/dist/"
+cd "$INSTALL_DIR"
+
+# ─── 8. Redis ────────────────────────────────────────────────
+hr
+echo -e "${BOLD}[7/9] Starting Redis${NC}"
+hr
+
+if sudo systemctl is-active --quiet redis-server 2>/dev/null; then
+  ok "Redis is already running"
+else
+  sudo systemctl enable redis-server > /dev/null 2>&1
+  sudo systemctl start redis-server
+  ok "Redis started and enabled on boot"
+fi
+
+# ─── 9. PM2 ecosystem config ────────────────────────────────
+hr
+echo -e "${BOLD}[8/9] Writing PM2 ecosystem config${NC}"
+hr
+
+cat > "$INSTALL_DIR/ecosystem.config.js" <<EOF
+// PM2 Ecosystem — DDN VSS Multimodal Semantic Search
+// Manage with: pm2 [start|stop|restart|logs|monit] all
+// or by name:  pm2 restart ddn-vss-backend
+
+module.exports = {
+  apps: [
+    // ── FastAPI backend ──────────────────────────────────────
+    {
+      name: 'ddn-vss-backend',
+      script: '${VENV_DIR}/bin/uvicorn',
+      args: 'main:app --host 0.0.0.0 --port ${BACKEND_PORT} --workers 2',
+      cwd: '${INSTALL_DIR}/backend',
+      interpreter: 'none',
+      env: {
+        PYTHONUNBUFFERED: '1',
+        PYTHONDONTWRITEBYTECODE: '1',
+      },
+      env_file: '${ENV_FILE}',
+      watch: false,
+      autorestart: true,
+      max_restarts: 10,
+      restart_delay: 3000,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      out_file: '${INSTALL_DIR}/logs/backend.log',
+      error_file: '${INSTALL_DIR}/logs/backend.error.log',
+      merge_logs: true,
+    },
+
+    // ── Frontend static server ───────────────────────────────
+    {
+      name: 'ddn-vss-frontend',
+      script: 'serve',
+      args: '-s dist -l ${FRONTEND_PORT}',
+      cwd: '${INSTALL_DIR}/frontend',
+      interpreter: 'none',
+      watch: false,
+      autorestart: true,
+      max_restarts: 10,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      out_file: '${INSTALL_DIR}/logs/frontend.log',
+      error_file: '${INSTALL_DIR}/logs/frontend.error.log',
+      merge_logs: true,
+    },
+  ],
+};
+EOF
+
+ok "ecosystem.config.js created"
+
+# Install 'serve' globally for static frontend hosting
+if ! command -v serve &>/dev/null; then
+  info "Installing 'serve' (static file server) globally..."
+  sudo npm install -g serve > /dev/null 2>&1
+  ok "'serve' installed"
+fi
+
+# Create logs directory
+mkdir -p "$INSTALL_DIR/logs"
+
+# ─── 10. Launch with PM2 ─────────────────────────────────────
+hr
+echo -e "${BOLD}[9/9] Starting services with PM2${NC}"
+hr
+
+# Stop existing processes gracefully if running
+pm2 delete ddn-backend ddn-celery ddn-frontend 2>/dev/null || true
+
+# Start all apps from ecosystem config
+pm2 start "$INSTALL_DIR/ecosystem.config.js"
+
+# Save process list so PM2 resurrects on machine restart
+pm2 save
+
+# Register PM2 startup script (generates a system command which we run)
+info "Registering PM2 as a startup service..."
+STARTUP_CMD=$(pm2 startup systemd -u "$USER" --hp "$HOME" | grep "sudo env" | head -1)
+if [ -n "$STARTUP_CMD" ]; then
+  eval "$STARTUP_CMD"
+  ok "PM2 startup registered"
+else
+  warn "Could not auto-register PM2 startup. Run manually: pm2 startup"
+fi
+
+# ─── Final summary ───────────────────────────────────────────
+hr
+echo ""
+echo -e "${GREEN}${BOLD}  ✔  Deployment Complete!${NC}"
+echo ""
+echo -e "${BOLD}  Service URLs:${NC}"
+echo -e "    ${CYAN}Frontend  →${NC}  http://localhost:${FRONTEND_PORT}"
+echo -e "    ${CYAN}Backend   →${NC}  http://localhost:${BACKEND_PORT}"
+echo -e "    ${CYAN}API Docs  →${NC}  http://localhost:${BACKEND_PORT}/docs"
+echo ""
+echo -e "${BOLD}  PM2 Quick Reference:${NC}"
+echo -e "    ${YELLOW}pm2 status${NC}               — view all services"
+echo -e "    ${YELLOW}pm2 monit${NC}                — live dashboard"
+echo -e "    ${YELLOW}pm2 logs${NC}                 — stream all logs"
+echo -e "    ${YELLOW}pm2 logs ddn-backend${NC}     — backend logs only"
+echo -e "    ${YELLOW}pm2 restart all${NC}          — restart everything"
+echo -e "    ${YELLOW}pm2 stop all${NC}             — stop everything"
+echo -e "    ${YELLOW}pm2 reload all${NC}           — zero-downtime reload"
+echo ""
+echo -e "${BOLD}  Config files:${NC}"
+echo -e "    ${YELLOW}$ENV_FILE${NC}        — environment variables"
+echo -e "    ${YELLOW}$INSTALL_DIR/ecosystem.config.js${NC}  — PM2 config"
+echo -e "    ${YELLOW}$INSTALL_DIR/logs/${NC}               — all log files"
+echo ""
+hr
