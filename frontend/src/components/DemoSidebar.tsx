@@ -36,7 +36,8 @@ export default function DemoSidebar({ tabs, activeTab, onTabChange }: DemoSideba
   useEffect(() => {
     const fetchHealth = async () => {
       try {
-        const response = await fetch('/api/health')
+        const healthUrl = 'http://172.20.146.6:8001/api/health'
+        const response = await fetch(healthUrl)
         if (response.ok) {
           const data = await response.json()
           setHealth({
